@@ -1,0 +1,74 @@
+#!/usr/bin/bash
+# Runs inside the built image (podman run). Prints the checks and exits non-zero
+# if any of them fail.
+
+set -uo pipefail
+
+FAIL=0
+pass() { echo "PASS: $*"; }
+fail() { echo "FAIL: $*"; FAIL=1; }
+
+KVER=$(ls /usr/lib/modules)
+echo "Kernel: $KVER"
+echo
+
+echo "=== 1. Legacy proprietary NVIDIA kernel module present ==="
+MOD=$(find "/usr/lib/modules/$KVER" -name 'nvidia.ko*' | head -1)
+if [[ -n "$MOD" ]]; then
+    LICENSE=$(modinfo -F license "$MOD")
+    VERSION=$(modinfo -F version "$MOD")
+    echo "module:  $MOD"
+    echo "version: $VERSION"
+    echo "license: $LICENSE"
+    rpm -q kmod-nvidia nvidia-driver 2>/dev/null
+    if [[ "$LICENSE" == "NVIDIA" ]]; then
+        pass "nvidia.ko is the proprietary (legacy) module, license=NVIDIA"
+    else
+        fail "nvidia.ko license is '$LICENSE' (open modules are 'Dual MIT/GPL')"
+    fi
+    if [[ "$VERSION" == 580.* ]]; then
+        pass "driver branch 580 (last branch supporting Maxwell/Pascal/Volta)"
+    else
+        fail "driver version $VERSION is not the 580 legacy branch"
+    fi
+else
+    fail "no nvidia.ko under /usr/lib/modules/$KVER"
+fi
+echo
+
+echo "=== 2. nvidia-open NOT installed ==="
+OPEN_PKGS=$(rpm -qa | grep -i 'nvidia.*open\|open.*nvidia' || true)
+if [[ -z "$OPEN_PKGS" ]]; then
+    pass "no nvidia-open packages installed"
+else
+    fail "nvidia-open packages found:"; echo "$OPEN_PKGS"
+fi
+OPEN_MODS=$(find "/usr/lib/modules/$KVER" -name 'nvidia*.ko*' -exec modinfo -F license {} \; | grep -c 'Dual MIT/GPL' || true)
+if [[ "$OPEN_MODS" -eq 0 ]]; then
+    pass "no open-source (Dual MIT/GPL) nvidia kernel modules"
+else
+    fail "$OPEN_MODS open-source nvidia kernel modules found"
+fi
+echo
+
+echo "=== 3. Steam Gaming Mode session (gamescope-session) present ==="
+rpm -qa | grep -i 'gamescope' | sort
+ls /usr/share/wayland-sessions/ 2>/dev/null
+if rpm -qa | grep -q '^gamescope-session' && ls /usr/share/wayland-sessions/ | grep -q gamescope; then
+    pass "gamescope-session installed with a Wayland session entry"
+else
+    fail "gamescope-session missing"
+fi
+echo
+
+echo "=== Extra info ==="
+cat /usr/share/ublue-os/image-info.json
+echo "Xbox controller kmods:"; rpm -qa | grep -i 'xone\|xpad' || true
+echo "Container signature policy (default):"; grep -m1 -A3 '"default"' /etc/containers/policy.json || true
+echo
+
+if [[ $FAIL -ne 0 ]]; then
+    echo "ONE OR MORE CHECKS FAILED"
+    exit 1
+fi
+echo "ALL CHECKS PASSED"

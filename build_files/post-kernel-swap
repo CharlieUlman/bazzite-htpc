@@ -1,0 +1,37 @@
+#!/usr/bin/bash
+# Restore what install-kernel-akmods removed and verify the kernel swap.
+
+set -eoux pipefail
+
+echo "::group::Executing post-kernel-swap"
+trap 'echo "::endgroup::"' EXIT
+
+STATE=/tmp/kernel-swap-state
+
+if [[ -s "$STATE/kernel-tools" ]]; then
+    xargs -a "$STATE/kernel-tools" dnf5 -y install
+fi
+
+KERNELS=$(ls /usr/lib/modules)
+echo "Kernel(s) after swap: $KERNELS"
+if [[ $(wc -w <<< "$KERNELS") -ne 1 || "$KERNELS" != *ogc-lts* && "$KERNELS" != 6.18.* ]]; then
+    echo "ERROR: expected exactly one ogc-lts kernel in /usr/lib/modules" >&2
+    exit 1
+fi
+
+echo "Kmod packages before -> after swap:"
+for pkg in $(cat "$STATE/kmods"); do
+    if rpm -q "$pkg" > /dev/null; then
+        echo "  OK      $(rpm -q "$pkg")"
+    else
+        echo "  MISSING $pkg (no ogc-lts build available)"
+    fi
+done
+
+# Every installed kmod must match the new kernel
+for pkg in $(rpm -qa --qf '%{NAME}\n' 'kmod-*'); do
+    if rpm -ql "$pkg" | grep '^/usr/lib/modules/' | grep -vq "^/usr/lib/modules/$KERNELS/"; then
+        echo "ERROR: $pkg ships modules for a different kernel" >&2
+        exit 1
+    fi
+done

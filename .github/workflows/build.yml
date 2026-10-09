@@ -1,164 +1,222 @@
 ---
-name: Build container image
+name: Build image and ISO
+
 on:
-  pull_request:
-    branches:
-      - main
   schedule:
-    - cron: '05 10 * * *'  # 10:05am UTC everyday
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - '**/README.md'
+    - cron: '30 6 * * *'  # daily image rebuild so installed PCs keep getting updates
   workflow_dispatch:
+    inputs:
+      build_iso:
+        description: "Also build the installer ISO and publish it as a release"
+        type: boolean
+        default: true
 
 env:
-  IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"  # do not edit
+  IMAGE_NAME: bazzite-deck-legacy-nvidia
+  UPSTREAM_DECK: ghcr.io/ublue-os/bazzite-deck:stable
+  UPSTREAM_NVIDIA: ghcr.io/ublue-os/bazzite-nvidia:stable
+  UPSTREAM_LIVE: ghcr.io/ublue-os/bazzite:stable
+  ISO_NAME: bazzite-deck-nvidia-legacy-custom.iso
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.brand_name}}-${{ inputs.stream_name }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build_push:
-    name: Build and push image
+  image:
+    name: Build, verify and push image
     runs-on: ubuntu-26.04
-
     permissions:
       contents: read
       packages: write
-      id-token: write
-
+    outputs:
+      image_ref: ${{ steps.vars.outputs.image_ref }}
+      version: ${{ steps.vars.outputs.version }}
+      revision: ${{ steps.vars.outputs.revision }}
     steps:
-      # These stage versions are pinned by https://github.com/renovatebot/renovate
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Maximize build space
-        uses: ublue-os/remove-unwanted-software@695eb75bc387dbcd9685a8e72d23439d8686cba6
-
-      - name: Install just
-        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 #v4.0.0
-
-      - name: Check Just Syntax
-        shell: bash
-        run: |
-          just check
-
-      - name: Image Name
-        id: image-name
-        run: |
-          IMAGE_NAME=$(just image_name)
-
-          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
-
-      - name: Default Tag
-        id: gen-default-tag
-        run: |
-          DEFAULT_TAG=$(just generate-default-tag)
-
-          echo "DEFAULT_TAG=${DEFAULT_TAG}" >> $GITHUB_ENV
-
-      - name: Prepare environment
-        run: |
-          # Lowercase the image uri https://github.com/macbre/push-to-ghcr/issues/12
-          echo "IMAGE_REGISTRY=${IMAGE_REGISTRY,,}" >> ${GITHUB_ENV}
-          echo "IMAGE_NAME=${IMAGE_NAME,,}" >> ${GITHUB_ENV}
-
-      # This actually builds the container image
-      - name: Build Image
-        id: build-image
-        run: |
-          just build \
-            ${IMAGE_NAME} \
-            ${DEFAULT_TAG}
-
-      # This is optional, this provides smaller delta updates
-      - name: Rechunk with rpm-ostree
-        id: rechunk
-        run: |
-          just ostree-rechunk \
-            ${IMAGE_NAME} \
-            ${DEFAULT_TAG}
-
-      # If you are feeling adventurous, use the new distro agnostic rechunker
-      # https://github.com/coreos/chunkah
-      # You can delete the Rechunk with rpm-ostree portion then if you use this
-      #- name: Rechunk with Chunkah
-      #  id: rechunk
-      #  run: |
-      #    just rechunk \
-      #      ${IMAGE_NAME} \
-      #      ${DEFAULT_TAG}
-
-      - name: Generate Build Tags
-        id: gen-build-tags
-        run: |
-          alias_tags="$(just generate-build-tags \
-                        ${IMAGE_NAME} \
-                        ${DEFAULT_TAG})"
-
-          echo "Tags for this Action..."
-          echo "${alias_tags}"
-          echo "alias_tags=${alias_tags}" >> $GITHUB_OUTPUT
-
-      - name: Tag Image
-        id: tag-images
-        env:
-          ALIAS_TAGS: ${{ steps.gen-build-tags.outputs.alias_tags }}
-        run: |
-          just tag-images \
-            "${IMAGE_NAME}" \
-            "${DEFAULT_TAG}" \
-            "${ALIAS_TAGS}"
-
-      # These `if` statements are so that pull requests for your custom images do not make it publish any packages under your name without you knowing
-      # They also check if the runner is on the default branch so that things like the merge queue (if you enable it), are going to work
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          tool-cache: true
 
-      - name: Push To GHCR
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        id: push-image
-        env:
-          ALIAS_TAGS: ${{ steps.gen-build-tags.outputs.alias_tags }}
+      - name: Mount container storage on a compressed btrfs loopback (same as Bazzite's ISO workflow)
         run: |
-          set -euox pipefail
-          for tag in ${ALIAS_TAGS}; do
-            podman push --digestfile=/tmp/digestfile ${IMAGE_NAME}:${tag} ${IMAGE_REGISTRY}/${IMAGE_NAME}:${tag}
+          sudo truncate -s 110G /mnt/podman-storage.img
+          sudo mkfs.btrfs -f -m single -d single /mnt/podman-storage.img
+          sudo podman system reset --force
+          LOOP=$(sudo losetup --find --show --direct-io=on /mnt/podman-storage.img)
+          sudo mkdir -p /mnt/podman-storage
+          sudo mount -o compress-force=zstd:2,discard=async,noatime "$LOOP" /mnt/podman-storage
+          sudo mkdir -p /mnt/podman-storage/storage /mnt/podman-storage/tmp /var/lib/containers/storage
+          sudo mount --bind /mnt/podman-storage/storage /var/lib/containers/storage
+          df -h
+
+      - name: Read upstream Bazzite versions
+        id: vars
+        run: |
+          set -euo pipefail
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          deck=$(skopeo inspect --no-tags "docker://${UPSTREAM_DECK}")
+          nv=$(skopeo inspect --no-tags "docker://${UPSTREAM_NVIDIA}")
+          REVISION=$(jq -r '.Labels["org.opencontainers.image.revision"]' <<< "$deck")
+          VERSION=$(jq -r '.Labels["org.opencontainers.image.version"]' <<< "$deck")
+          DECK_DIGEST=$(jq -r '.Digest' <<< "$deck")
+          DECK_KERNEL=$(jq -r '.Labels["ostree.linux"]' <<< "$deck")
+          LTS_KERNEL=$(jq -r '.Labels["ostree.linux"]' <<< "$nv")
+          NV_REVISION=$(jq -r '.Labels["org.opencontainers.image.revision"]' <<< "$nv")
+          FEDORA="${VERSION%%.*}"
+          echo "bazzite-deck:stable   revision=$REVISION version=$VERSION kernel=$DECK_KERNEL"
+          echo "bazzite-nvidia:stable revision=$NV_REVISION kernel=$LTS_KERNEL"
+          if [[ "$REVISION" != "$NV_REVISION" ]]; then
+            echo "::warning::bazzite-deck and bazzite-nvidia :stable were built from different commits"
+          fi
+          {
+            echo "revision=$REVISION"
+            echo "version=$VERSION"
+            echo "base_image=ghcr.io/ublue-os/bazzite-deck@${DECK_DIGEST}"
+            echo "akmods_tag=ogc-lts-${FEDORA}-${LTS_KERNEL}"
+            echo "owner=$OWNER"
+            echo "image_ref=ghcr.io/${OWNER}/${IMAGE_NAME}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout ublue-os/bazzite at the base image's revision
+        uses: actions/checkout@v4
+        with:
+          repository: ublue-os/bazzite
+          ref: ${{ steps.vars.outputs.revision }}
+          path: upstream
+          sparse-checkout: |
+            build_files
+            system_files/nvidia
+          sparse-checkout-cone-mode: true
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.vars.outputs.version }}"
+          sudo env TMPDIR=/mnt/podman-storage/tmp podman build \
+            --pull=newer \
+            --security-opt label=disable \
+            --build-arg BASE_IMAGE="${{ steps.vars.outputs.base_image }}" \
+            --build-arg AKMODS_TAG="${{ steps.vars.outputs.akmods_tag }}" \
+            --build-arg IMAGE_NAME="${IMAGE_NAME}" \
+            --build-arg IMAGE_VENDOR="${{ steps.vars.outputs.owner }}" \
+            --build-arg IMAGE_BRANCH=stable \
+            --build-arg BASE_IMAGE_NAME=kinoite \
+            --build-arg VERSION_TAG="${VERSION}" \
+            --build-arg VERSION_PRETTY="Stable (F${VERSION})" \
+            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+            --label org.opencontainers.image.version="${VERSION}" \
+            --label org.opencontainers.image.title="${IMAGE_NAME}" \
+            --label org.opencontainers.image.description="Bazzite Gaming Mode (KDE deck) with the legacy NVIDIA 580 driver for Maxwell/Pascal/Volta" \
+            -t "localhost/${IMAGE_NAME}:stable" \
+            .
+          sudo df -h /mnt/podman-storage
+
+      - name: Verify image (legacy NVIDIA module, no nvidia-open, gamescope-session)
+        run: |
+          set -o pipefail
+          sudo podman run --rm --network=none \
+            -v "$PWD/build_files/verify-image:/verify-image:ro" \
+            --entrypoint /usr/bin/bash \
+            "localhost/${IMAGE_NAME}:stable" /verify-image | tee verify.log
+          {
+            echo '## Image verification'
+            echo '```'
+            cat verify.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push to GHCR
+        run: |
+          set -euo pipefail
+          REF="${{ steps.vars.outputs.image_ref }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          for tag in stable "stable-${{ steps.vars.outputs.version }}"; do
+            sudo podman push --compression-format=zstd:chunked "localhost/${IMAGE_NAME}:stable" "${REF}:${tag}"
           done
+          echo "Pushed ${REF}:stable" >> "$GITHUB_STEP_SUMMARY"
 
-          digest=$(< /tmp/digestfile)
-
-          echo "digest=${digest}" >> $GITHUB_OUTPUT
-
-      # This section is optional and only needs to be enabled if you plan on distributing
-      # your project for others to consume. You will need to create a public and private key
-      # using Cosign and save the private key as a repository secret in Github for this workflow
-      # to consume. For more details, review the image signing section of the README.
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+  iso:
+    name: Build installer ISO
+    needs: image
+    if: github.event_name == 'workflow_dispatch' && inputs.build_iso
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
-          # be careful when upgrading major versions
-          cosign-release: 'v3.1.2'
+          tool-cache: true
 
-      - name: Sign container image
-        id: sign-image
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        env:
-          COSIGN_EXPERIMENTAL: false
-          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
-          DIGEST: ${{ steps.push-image.outputs.digest }}
+      - name: Mount container storage on a compressed btrfs loopback
         run: |
-          # https://github.com/containers/container-libs/issues/388
-          # https://github.com/coreos/rpm-ostree/issues/5509
-          # use old bundle format, so we can use newer cosign 3.X.X instead of 2.X.X
-          cosign sign -y --new-bundle-format=false --use-signing-config=false --key env://COSIGN_PRIVATE_KEY ${IMAGE_REGISTRY}/${IMAGE_NAME}@${DIGEST}
+          sudo truncate -s 110G /mnt/podman-storage.img
+          sudo mkfs.btrfs -f -m single -d single /mnt/podman-storage.img
+          sudo podman system reset --force
+          LOOP=$(sudo losetup --find --show --direct-io=on /mnt/podman-storage.img)
+          sudo mkdir -p /mnt/podman-storage
+          sudo mount -o compress-force=zstd:2,discard=async,noatime "$LOOP" /mnt/podman-storage
+          sudo mkdir -p /mnt/podman-storage/storage /mnt/podman-storage/tmp /var/lib/containers/storage
+          sudo mount --bind /mnt/podman-storage/storage /var/lib/containers/storage
+          df -h
 
+      - name: Checkout ublue-os/bazzite installer at the base image's revision
+        uses: actions/checkout@v4
+        with:
+          repository: ublue-os/bazzite
+          ref: ${{ needs.image.outputs.revision }}
+          path: upstream
+          sparse-checkout: installer
+          sparse-checkout-cone-mode: true
+
+      # Same as Bazzite's build_iso.yml: the live session runs the plain
+      # bazzite image, and the installer installs INSTALL_IMAGE_PAYLOAD and
+      # then `bootc switch`es to it so the installed PC updates from GHCR.
+      - name: Build installer container
+        run: |
+          sudo env TMPDIR=/mnt/podman-storage/tmp podman build \
+            --cap-add sys_admin \
+            --security-opt label=disable \
+            --build-arg BASE_IMAGE="${UPSTREAM_LIVE}" \
+            --build-arg INSTALL_IMAGE_PAYLOAD="${{ needs.image.outputs.image_ref }}:stable" \
+            --build-arg FLATPAK_DIR_SHORTNAME=kde_flatpaks \
+            -t localhost/payload:latest upstream/installer/
+
+      - name: Build ISO (titanoboa, as used by Bazzite)
+        uses: Zeglius/titanoboa@revamp-pr
+        id: build
+        with:
+          image-ref: localhost/payload:latest
+          iso-dest: ${{ env.ISO_NAME }}
+
+      - name: Checksum and split for release upload (2 GiB per-asset limit)
+        id: split
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          mv "${{ steps.build.outputs.iso-dest }}" "upload/${ISO_NAME}"
+          cd upload
+          ls -l "${ISO_NAME}"
+          sha256sum "${ISO_NAME}" | tee "${ISO_NAME}.sha256"
+          split -b 1900M -d -a 2 "${ISO_NAME}" "${ISO_NAME}.part"
+          rm "${ISO_NAME}"
+          sha256sum "${ISO_NAME}".part* | tee "${ISO_NAME}.parts.sha256"
+          ls -l
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="iso-${{ needs.image.outputs.version }}-${{ github.run_number }}"
+          gh release create "$TAG" upload/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "ISO ${{ needs.image.outputs.version }} (run ${{ github.run_number }})" \
+            --notes "Installer for ${{ needs.image.outputs.image_ref }}:stable. Download all .partNN files, concatenate them in order, and check against ${ISO_NAME}.sha256."
+          echo "Release: $TAG" >> "$GITHUB_STEP_SUMMARY"

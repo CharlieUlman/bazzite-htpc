@@ -1,0 +1,40 @@
+#!/usr/bin/bash
+# Prepare the bazzite-deck image for Bazzite's install-kernel-akmods, which was
+# written for a base image that has no kernel kmods yet.
+
+set -eoux pipefail
+
+echo "::group::Executing pre-kernel-swap"
+trap 'echo "::endgroup::"' EXIT
+
+STATE=/tmp/kernel-swap-state
+mkdir -p "$STATE"
+
+echo "Current kernel(s):"
+ls /usr/lib/modules
+
+# Drop the versionlocks for the old kernel so the new one can be locked
+dnf5 versionlock delete kernel kernel-devel kernel-devel-matched kernel-core kernel-modules || true
+
+# install-kernel-akmods erases kernel-tools/-libs without reinstalling them
+rpm -qa --qf '%{NAME}\n' 'kernel-tools*' | sort -u > "$STATE/kernel-tools" || true
+
+# Remove kmod packages built for the old kernel (they ship files under
+# /usr/lib/modules, which install-kernel-akmods wipes). Not kmod/kmod-libs.
+: > "$STATE/kmods"
+for pkg in $(rpm -qa --qf '%{NAME}\n' 'kmod-*' | sort -u); do
+    if rpm -ql "$pkg" | grep -q '^/usr/lib/modules/'; then
+        echo "$pkg" >> "$STATE/kmods"
+    fi
+done
+echo "Old-kernel kmod packages to replace:"
+cat "$STATE/kmods"
+if [[ -s "$STATE/kmods" ]]; then
+    xargs -a "$STATE/kmods" rpm --erase --nodeps
+fi
+
+# Old kernel-devel packages would be left behind otherwise
+OLD_DEVEL=$(rpm -qa 'kernel-devel*' || true)
+if [[ -n "$OLD_DEVEL" ]]; then
+    rpm --erase --nodeps $OLD_DEVEL
+fi
