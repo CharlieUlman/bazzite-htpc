@@ -80,10 +80,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout this repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Checkout ublue-os/bazzite at the base image's revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ublue-os/bazzite
           ref: ${{ steps.vars.outputs.revision }}
@@ -167,7 +167,7 @@ jobs:
           df -h
 
       - name: Checkout ublue-os/bazzite installer at the base image's revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ublue-os/bazzite
           ref: ${{ needs.image.outputs.revision }}
